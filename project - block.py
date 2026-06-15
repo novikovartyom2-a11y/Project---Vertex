@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from plyer import notification
 import json
 import math
 import random
@@ -338,7 +338,7 @@ class ActionCard(QFrame):
         self.dot = QLabel("●")
         self.dot.setStyleSheet(f"color: {action.intensity_color()}; font-size: 18px;")
         # счётчик выполнений
-        self.done_lbl = QLabel(f {action.done_today} сегодня  /  {action.done_total} всего")
+        self.done_lbl = QLabel(f"{action.done_today} сегодня  /  {action.done_total} всего")
         self.done_lbl.setStyleSheet("color: #9aa4b2; font-size: 12px;")
         top.addWidget(lbl_title)
         top.addStretch(1)
@@ -693,7 +693,7 @@ class AddActionPage(QWidget):
         self.repetitions_mode.addItems(["Фиксированное количество", "Диапазон количества"])
         self.repetitions_from = IntBox(1, 9999, 3)
         self.repetitions_to   = IntBox(1, 9999, 5)
-        form.addRow(hl("Количество напоминаний", "Сколько раз в день),
+        form.addRow(hl("Количество напоминаний", "Сколько раз в день"),
                     self._pair(self.repetitions_from, self.repetitions_to))
 
         # Срок действия
@@ -1071,12 +1071,110 @@ class PulseWidget(QWidget):
         painter.drawEllipse(cx - 22, cy - 22, 44, 44)
 
 
+# планировщик уведомлений
+
+class NotificationScheduler:
+    """
+    Следит за активными действиями и отправляет системные уведомления
+    в нужное время. Работает только пока включён режим Старт.
+
+    Логика:
+    - Каждую минуту проверяем все enabled-действия.
+    - Для каждого действия вычисляем интервал напоминания (reminder_from_min
+      или случайное значение в диапазоне reminder_from_min..reminder_to_min).
+    - Если с последнего уведомления по этому действию прошло >= интервала —
+      отправляем уведомление и обновляем время последнего срабатывания.
+    - Проверяем, что текущее время находится в окне activity_start..activity_end.
+    - Проверяем, что действие активно сегодня (is_active_on).
+    """
+
+    def __init__(self, get_actions, get_is_running):
+        self._get_actions    = get_actions
+        self._get_is_running = get_is_running
+        # uid -> datetime последнего уведомления
+        self._last_sent: dict[str, datetime] = {}
+        # uid -> текущий интервал (в минутах)
+        self._current_interval: dict[str, int] = {}
+
+        self._timer = QTimer()
+        self._timer.setInterval(60_000)  # раз в минуту
+        self._timer.timeout.connect(self._tick)
+
+    def start(self):
+        self._timer.start()
+
+    def stop(self):
+        self._timer.stop()
+        self._last_sent.clear()
+        self._current_interval.clear()
+
+    def _tick(self):
+        if not self._get_is_running():
+            return
+
+        now   = datetime.now()
+        today = now.date()
+
+        for action in self._get_actions():
+            if not action.enabled:
+                continue
+            if not action.is_active_on(today):
+                continue
+
+            # проверяем окно активности
+            now_t = now.time().replace(second=0, microsecond=0)
+            if not (action.activity_start <= now_t <= action.activity_end):
+                continue
+
+            # берём или генерируем интервал для этого действия
+            if action.uid not in self._current_interval:
+                self._current_interval[action.uid] = self._pick_interval(action)
+
+            interval = self._current_interval[action.uid]
+            last     = self._last_sent.get(action.uid)
+
+            if last is None or (now - last).total_seconds() >= interval * 60:
+                self._send(action)
+                self._last_sent[action.uid] = now
+                # после срабатывания выбираем следующий интервал
+                self._current_interval[action.uid] = self._pick_interval(action)
+
+    @staticmethod
+    def _pick_interval(action: ActionItem) -> int:
+        if action.reminder_type == "fixed":
+            return action.reminder_from_min
+        return random.randint(action.reminder_from_min, action.reminder_to_min)
+
+    @staticmethod
+    def _send(action: ActionItem):
+        sev_titles = {
+            1: "Напоминание",
+            2: "⚠ Важное напоминание",
+            3: "🚨 Срочное напоминание",
+        }
+        title   = sev_titles.get(action.severity, "Напоминание")
+        message = action.title
+
+        if action.severity >= 2 and action.time_limit_minutes:
+            message += f"\nВремя на выполнение: {action.time_limit_minutes} мин"
+
+        try:
+            notification.notify(
+                title=title,
+                message=message,
+                app_name="Vertex / TaskPulse",
+                timeout=10 if action.severity == 1 else 0,
+            )
+        except Exception:
+            pass  # если plyer не поддерживается на платформе — тихо игнорируем
+
+
 # главная
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TaskPulse")
+        self.setWindowTitle("Vertex")
         self.resize(1280, 780)
         self.setMinimumSize(1100, 700)
 
@@ -1115,6 +1213,11 @@ class MainWindow(QMainWindow):
 
         self.overlay = OverlayBlocker(self.centralWidget())
         self.overlay.raise_()
+
+        self._notif_scheduler = NotificationScheduler(
+            get_actions    = lambda: self.actions,
+            get_is_running = lambda: self.is_running,
+        )
 
         self._build_timers()
         self._apply_theme()
@@ -1161,7 +1264,7 @@ class MainWindow(QMainWindow):
         # топ
         top = QHBoxLayout()
         vb  = QVBoxLayout()
-        lbl = QLabel("TaskPulse")
+        lbl = QLabel("Vertex")
         lbl.setStyleSheet("font-size: 28px; font-weight: 900;")
         sub = QLabel("Управление расписанием и действиями")
         sub.setStyleSheet(f"color: {MUTED}; font-size: 13px;")
@@ -1418,8 +1521,10 @@ class MainWindow(QMainWindow):
         self.is_running = not self.is_running
         if self.is_running:
             self.continuous_start = datetime.now()
+            self._notif_scheduler.start()
         else:
             self.continuous_start = None
+            self._notif_scheduler.stop()
             # сбрасываем счётчик выполнений за сессию
             self.session_done = 0
             for a in self.actions:
@@ -1572,4 +1677,3 @@ if __name__ == "__main__":
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
-
